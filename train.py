@@ -31,7 +31,48 @@ import wandb
 #using quintic iteration
 #only for 2d matrices
 #other dimenional matrices go through AdamW
-def zeropower_via_newtonschulz(G, ns_steps):
+@torch.no_grad()
+def power_iteration_spectral_norm(X, state, state_key="power_v", cold_iters=5, warm_iters=2, eps=1e-7):
+    """
+    Warm-started power iteration for ||X||_2 (max singular value).
+    Iterates u in R^m via X @ X.T (cheaper than X.T @ X when m <= n after muon transpose).
+    """
+    Xf = X.float()
+    m = Xf.size(-2)
+    fro = Xf.norm().clamp_min(eps)
+    #||X||_2 >= ||X||_F / sqrt(m) 
+    # underestimating sigma blows up X / sigma before NS
+    sigma_lo = fro / (m ** 0.5)
+
+    u = state.get(state_key)
+    n_iters = warm_iters
+    if u is None or u.shape[0] != m or u.device != X.device or not torch.isfinite(u).all():
+        n_iters = cold_iters
+        u = torch.randn(m, device=X.device, dtype=torch.float32)
+        u = u / u.norm().clamp_min(eps)
+    else:
+        u = u.float()
+
+    for _ in range(n_iters):
+        u = Xf @ (Xf.mT @ u)
+        u_norm = u.norm()
+        if not torch.isfinite(u_norm) or u_norm < eps:
+            state.pop(state_key, None)
+            return fro.to(dtype=X.dtype)
+        u = u / u_norm
+
+    state[state_key] = u #float32 warm-start vector
+
+    sigma = (Xf.mT @ u).norm()
+    if not torch.isfinite(sigma):
+        state.pop(state_key, None)
+        return fro.to(dtype=X.dtype)
+
+    sigma = sigma.clamp(min=sigma_lo, max=fro)
+    return sigma.clamp_min(eps).to(dtype=X.dtype)
+
+
+def zeropower_via_newtonschulz(G, ns_steps, state=None, state_key="power_v"):
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
@@ -39,9 +80,11 @@ def zeropower_via_newtonschulz(G, ns_steps):
     #muon more stable with wider matrices
     if G.size(-2) > G.size(-1):
         X = X.mT
-    
-    #frobenius norm, make sure 1
-    X = X / (X.norm(dim=(-2,-1), keepdim=True) + 1e-7)
+
+    # spectral norm via warm-started power iteration: scale so sigma_max ~= 1
+    sigma = power_iteration_spectral_norm(X, state, state_key)
+    X = X / sigma
+
     #ns iterations
     for step in range(ns_steps):
         A = X @ X.mT
@@ -60,7 +103,7 @@ def zeropower_via_newtonschulz(G, ns_steps):
 #smoothens gradient using momentum
 #orthogonalize it
 #rescale
-def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+def muon_update(grad, momentum, state, beta=0.95, ns_steps=5, nesterov=True):
     #ema
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
@@ -68,10 +111,13 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
         update = update.view(len(update), -1)
     #split grouped QKV parameters
     if update.size(0) == 3 * update.size(1):
-        update = torch.cat([zeropower_via_newtonschulz(g, ns_steps) for g in update.split(update.size(1))])
+        update = torch.cat([
+            zeropower_via_newtonschulz(g, ns_steps, state, state_key=f"power_v_{i}")
+            for i, g in enumerate(update.split(update.size(1)))
+        ])
         scale = update.size(1)**0.5
     else:
-        update = zeropower_via_newtonschulz(update, ns_steps)
+        update = zeropower_via_newtonschulz(update, ns_steps, state)
         scale = max(update.size(0), update.size(1))**0.5  #update.square().mean() == 1
     return update, scale
 
@@ -119,7 +165,7 @@ class Muon(torch.optim.Optimizer):
                         state['momentum_buffer'] = torch.zeros_like(p)
                     #ema of past gradients
                     mbuf = state['momentum_buffer']
-                    update, scale = muon_update(p.grad, mbuf, beta=group['momentum'])
+                    update, scale = muon_update(p.grad, mbuf, state, beta=group['momentum'])
                     #weight decay w ← (1 − lr * weight_decay) w
                     p.mul_(1 - group['lr'] * group['weight_decay'])
                     p.add_(update.reshape(p.shape), alpha=-group['lr'] * scale)
