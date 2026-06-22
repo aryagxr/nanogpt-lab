@@ -194,8 +194,10 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         self.rope = RoPE(self.head_dim)
+        #weight to learn how much v1 to mix in (for value residual shortcut)
+        self.lamb = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, x):
+    def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
@@ -204,6 +206,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim)  # (B, T, nh, hs)
         k = k.view(B, T, self.n_head, self.head_dim)
         v = v.view(B, T, self.n_head, self.head_dim)
+
+        #value residual shortcut
+        #to save v1 for deeper blocks
+        if v1 is None:
+            v1 = v
+        #(1−λ)v+λv=v
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v)
+        
         cos, sin = self.rope(q)  
         q = rope_rotate(q, cos, sin)
         k = rope_rotate(k, cos, sin)
@@ -217,7 +227,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         # y = y / math.sqrt(24)
-        return y
+        return y, v1
 
 class MLP(nn.Module):
 
@@ -240,11 +250,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x):
-        x = x + self.attn(rmsnorm(x))
+    def forward(self, x, v1, x0):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        attn_out, v1 = self.attn(rmsnorm(x), v1)
+        x = x + attn_out
         x = x + self.mlp(rmsnorm(x))
-        return x
+        return x, v1
 
 
 #GPT2
@@ -269,8 +282,10 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lm_head.weight.data.zero_()
+        # self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+        #untying this
+        # self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -284,19 +299,26 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # (b, t, n_embd)
+        tok_emb = rmsnorm(tok_emb)
         x = tok_emb  # no absolute position embedding — RoPE handles position inside attention
+        x0 = tok_emb
 
+        v1 = None
         for block in self.transformer.h:
-            x = block(x)
+            x, v1 = block(x, v1, x0)
         x = rmsnorm(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            logits = 30 * torch.tanh(logits / 30)
+            logits = logits.float()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = 30 * torch.tanh(logits / 30)
+            logits = logits.float()
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -539,9 +561,14 @@ if __name__ == "__main__":
     #     betas=(0.9, 0.95),
     #     device_type=device,
     # )
+    h_params = list(raw_model.transformer.h.parameters())
+    matrix_params = [p for p in h_params if p.ndim >= 2]
+    scalar_params = [p for p in h_params if p.ndim < 2]  #per-layer lamb + lambdas
     param_groups = [
-    dict(params=list(raw_model.transformer.h.parameters()), use_muon=True),
+    dict(params=matrix_params, use_muon=True, momentum=0.85),
+    dict(params=scalar_params, use_muon=False, lr=0.02, betas=(0.9, 0.95), eps=1e-8, weight_decay=0),
     dict(params=list(raw_model.lm_head.parameters()), use_muon=False, lr=args.learning_rate, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay),
+    dict(params=[raw_model.transformer.wte.weight], use_muon=False, lr=args.learning_rate, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay)
     ]
     optimizer = Muon(param_groups)
 
@@ -668,6 +695,8 @@ if __name__ == "__main__":
         for pg in optimizer.param_groups:
             if pg['use_muon']:
                 pg['lr'] = 0.1 * args.learning_rate * lr_schedule
+                frac = min(step / 500, 1)
+                pg['momentum'] = (1 - frac) * 0.85 + frac * 0.95
             else:
                 pg['lr'] = args.learning_rate * lr_schedule
         optimizer.step()
