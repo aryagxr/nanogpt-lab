@@ -26,42 +26,37 @@ from torch.distributed import init_process_group, destroy_process_group
 import wandb
 
 
-
-#orthogonalize gradient with ns iterations
-#using quintic iteration
-#only for 2d matrices
-#other dimenional matrices go through AdamW
+#power iter
 @torch.no_grad()
-def power_iteration_spectral_norm(X, state, state_key="power_v", cold_iters=5, warm_iters=2, eps=1e-7):
-    """
-    Warm-started power iteration for ||X||_2 (max singular value).
-    Iterates u in R^m via X @ X.T (cheaper than X.T @ X when m <= n after muon transpose).
-    """
+def power_iteration_spectral_norm(X, state, state_key="power_v", min_iters=3, max_iters=60, rtol=1e-3, eps=1e-7):
     Xf = X.float()
     m = Xf.size(-2)
     fro = Xf.norm().clamp_min(eps)
-    #||X||_2 >= ||X||_F / sqrt(m) 
-    # underestimating sigma blows up X / sigma before NS
     sigma_lo = fro / (m ** 0.5)
 
     u = state.get(state_key)
-    n_iters = warm_iters
     if u is None or u.shape[0] != m or u.device != X.device or not torch.isfinite(u).all():
-        n_iters = cold_iters
         u = torch.randn(m, device=X.device, dtype=torch.float32)
         u = u / u.norm().clamp_min(eps)
     else:
         u = u.float()
 
-    for _ in range(n_iters):
+    #doing XX^T because matrix is not square all the time
+    #XX^T finds top left SV
+    prev_est = None
+    for i in range(max_iters):
         u = Xf @ (Xf.mT @ u)
         u_norm = u.norm()
         if not torch.isfinite(u_norm) or u_norm < eps:
             state.pop(state_key, None)
             return fro.to(dtype=X.dtype)
         u = u / u_norm
+        est = u_norm.sqrt()
+        if prev_est is not None and i + 1 >= min_iters and abs(est - prev_est) <= rtol * est:
+            break
+        prev_est = est
 
-    state[state_key] = u #float32 warm-start vector
+    state[state_key] = u
 
     sigma = (Xf.mT @ u).norm()
     if not torch.isfinite(sigma):
@@ -72,24 +67,39 @@ def power_iteration_spectral_norm(X, state, state_key="power_v", cold_iters=5, w
     return sigma.clamp_min(eps).to(dtype=X.dtype)
 
 
+#margin to prevent sv max going above 1
+SPECTRAL_MARGIN = 1.05
+
+
+def _ns_iterations(X, ns_steps, a, b, c):
+    for _ in range(ns_steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X
+
+
 def zeropower_via_newtonschulz(G, ns_steps, state=None, state_key="power_v"):
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    X = G.float()
     #if tall matrix, transpose
     #muon more stable with wider matrices
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # spectral norm via warm-started power iteration: scale so sigma_max ~= 1
     sigma = power_iteration_spectral_norm(X, state, state_key)
-    X = X / sigma
+    Xn = (X / (sigma.float() * SPECTRAL_MARGIN)).bfloat16()
+    out = _ns_iterations(Xn, ns_steps, a, b, c)
 
-    #ns iterations
-    for step in range(ns_steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+
+    if not torch.isfinite(out).all():
+        if state is not None:
+            state.pop(state_key, None)
+        print(f"[power_muon] NS diverged for shape {list(G.shape)}; redoing with Frobenius norm this step")
+        Xn = (X / X.norm().clamp_min(1e-7)).bfloat16()
+        out = _ns_iterations(Xn, ns_steps, a, b, c)
+    X = out
 
     #transpose back the tall matrices
     if G.size(-2) > G.size(-1):
@@ -118,7 +128,7 @@ def muon_update(grad, momentum, state, beta=0.95, ns_steps=5, nesterov=True):
         scale = update.size(1)**0.5
     else:
         update = zeropower_via_newtonschulz(update, ns_steps, state)
-        scale = max(update.size(0), update.size(1))**0.5  #update.square().mean() == 1
+        scale = max(update.size(0), update.size(1))**0.5
     return update, scale
 
 
