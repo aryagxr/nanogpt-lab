@@ -1,4 +1,7 @@
+import json
 import os
+import time
+import tomllib
 import re
 import subprocess
 from datetime import datetime
@@ -19,6 +22,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.5.1", "numpy", "huggingface_hub", "wandb")
     .add_local_file("train.py", "/root/train.py")
+    .add_local_dir("nanogpt", "/root/nanogpt", ignore=["__pycache__"])
 )
 
 
@@ -44,22 +48,24 @@ def download_data(num_shards: int = 18):
     data_volume.commit()
 
 
-def run_training(gpus: int, project: str, name: str, track: str):
+def run_training(gpus: int, project: str, name: str, track: str, config_text: str, revision: dict):
     import wandb
 
+    config = tomllib.loads(config_text)
+    batch_tokens = config["training"]["batch_tokens"]
     run = wandb.init(
         project=project,
         name=name or None,
-        config={
-            "gpus": gpus,
-            "train_steps": 3325,
-            "tokens_per_step": 524288,
-            "total_train_tokens": 3325 * 524288,
-        },
+        config={**config, **revision, "gpus": gpus},
     )
-    experiment = re.sub(r"[^a-z0-9]+", "_", (name or run.id).lower()).strip("_")
-    record_dir = Path(logs_dir) / track / f"{datetime.now():%Y%m%d}_{experiment}"
-    existing_logs = set(Path(logs_dir).glob("*.txt"))
+    experiment = re.sub(r"[^a-z0-9]+", "_", (name or run.id).lower()).strip("_") or run.id
+    record_dir = Path(logs_dir) / track / f"{datetime.now():%Y%m%d}_{experiment}_{run.id}"
+    record_dir.mkdir(parents=True, exist_ok=False)
+    config_path = record_dir / "config.toml"
+    config_path.write_text(config_text)
+    metrics = {**revision, "gpus": gpus, "wandb_url": run.url, "status": "running"}
+    started = time.perf_counter()
+
     run.define_metric("train/tokens")
     run.define_metric("training/*", step_metric="train/tokens")
     run.define_metric("validation/*", step_metric="train/tokens")
@@ -70,15 +76,14 @@ def run_training(gpus: int, project: str, name: str, track: str):
     training_line = re.compile(
         r"step:(\d+)/(\d+) train_loss:([0-9.eE+-]+) tokens:(\d+) "
         r"step_time:([0-9.eE+-]+)s grad_norm:([0-9.eE+-]+) "
-        r"param_norm:([0-9.eE+-]+) peak_gpu_memory_bytes:(\d+) "
-        r"lr_embed:([0-9.eE+-]+) lr_head:([0-9.eE+-]+) "
-        r"lr_scalar:([0-9.eE+-]+) lr_muonh:([0-9.eE+-]+)"
+        r"param_norm:([0-9.eE+-]+) peak_gpu_memory_bytes:(\d+)"
     )
     validation_line = re.compile(
         r"step:(\d+)/(\d+) val_loss:([0-9.]+) best_val_loss:([0-9.]+)"
     )
     parameter_line = re.compile(r"num_params:(\d+)")
 
+    output = (record_dir / "output.log").open("w", buffering=1)
     try:
         process = subprocess.Popen(
             [
@@ -86,9 +91,10 @@ def run_training(gpus: int, project: str, name: str, track: str):
                 "--standalone",
                 f"--nproc-per-node={gpus}",
                 "/root/train.py",
+                "--config", str(config_path),
             ],
             cwd="/root",
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "LOG_DIR": f"/tmp/nanogpt-logs/{run.id}"},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -96,6 +102,7 @@ def run_training(gpus: int, project: str, name: str, track: str):
         )
         for line in process.stdout:
             print(line, end="", flush=True)
+            output.write(line)
             parameter_match = parameter_line.search(line)
             if parameter_match:
                 parameter_count = int(parameter_match.group(1))
@@ -112,10 +119,8 @@ def run_training(gpus: int, project: str, name: str, track: str):
                         "optimization/gradient_norm": float(training_match.group(6)),
                         "model/parameter_norm": float(training_match.group(7)),
                         "system/peak_gpu_memory_gb": int(training_match.group(8)) / 1e9,
-                        "learning_rate/embed": float(training_match.group(9)),
-                        "learning_rate/head": float(training_match.group(10)),
-                        "learning_rate/scalar": float(training_match.group(11)),
-                        "learning_rate/muonh": float(training_match.group(12)),
+                        **{f"learning_rate/{key}": float(value)
+                           for key, value in re.findall(r"lr_(\w+):([0-9.eE+-]+)", line)},
                     }
                 )
             validation_match = validation_line.search(line)
@@ -123,7 +128,7 @@ def run_training(gpus: int, project: str, name: str, track: str):
                 step = int(validation_match.group(1))
                 run.log(
                     {
-                        "train/tokens": step * 524288,
+                        "train/tokens": step * batch_tokens,
                         "validation/loss": float(validation_match.group(3)),
                         "validation/best_loss": float(validation_match.group(4)),
                     }
@@ -131,13 +136,18 @@ def run_training(gpus: int, project: str, name: str, track: str):
         returncode = process.wait()
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, process.args)
+        metrics["status"] = "completed"
     finally:
-        run.finish()
-        record_dir.mkdir(parents=True, exist_ok=True)
-        for logfile in set(Path(logs_dir).glob("*.txt")) - existing_logs:
-            logfile.replace(record_dir / logfile.name)
-        Path(record_dir / "train.py").write_bytes(Path("/root/train.py").read_bytes())
+        output.close()
+        metrics.update(dict(run.summary))
+        metrics["wall_clock_seconds"] = time.perf_counter() - started
+        if metrics["status"] != "completed":
+            metrics["status"] = "failed"
+        (record_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         logs_volume.commit()
+        run.finish()
+        print(f"Saved run: {record_dir.relative_to(logs_dir)}")
+
 
 
 train_options = {
@@ -149,22 +159,31 @@ train_options = {
 
 
 @app.function(gpu="H100:8", **train_options)
-def train_8(project: str, name: str, track: str):
-    run_training(8, project, name, track)
+def train_8(project: str, name: str, track: str, config_text: str, revision: dict):
+    run_training(8, project, name, track, config_text, revision)
 
 
 @app.function(gpu="H100:4", **train_options)
-def train_4(project: str, name: str, track: str):
-    run_training(4, project, name, track)
+def train_4(project: str, name: str, track: str, config_text: str, revision: dict):
+    run_training(4, project, name, track, config_text, revision)
 
 
 @app.local_entrypoint()
-def main(gpus: int = 8, project: str = "nanogpt-lab", name: str = "", track: str = "dense"):
+def main(gpus: int = 8, project: str = "nanogpt-lab", name: str = "", track: str = "dense",
+         config: str = "configs/baseline.toml"):
+    config_text = Path(config).read_text()
+    tomllib.loads(config_text)
+    revision = {
+        "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "git_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()),
+    }
+    if revision["git_dirty"]:
+        print("Uncommitted changes: the recorded commit alone will not reproduce this run.")
     if track not in {"dense", "sparse"}:
         raise ValueError("--track must be dense or sparse")
     if gpus == 8:
-        train_8.remote(project, name, track)
+        train_8.remote(project, name, track, config_text, revision)
     elif gpus == 4:
-        train_4.remote(project, name, track)
+        train_4.remote(project, name, track, config_text, revision)
     else:
         raise ValueError("--gpus must be 4 or 8")
