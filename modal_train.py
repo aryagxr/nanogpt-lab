@@ -1,142 +1,159 @@
 import os
+import re
+import subprocess
+
 import modal
 
 
-app = modal.App("nanogpt-baseline")
+app = modal.App("nanogpt-ablations")
 
+data_volume = modal.Volume.from_name("fineweb-data", create_if_missing=True)
+logs_volume = modal.Volume.from_name("nanogpt-logs", create_if_missing=True)
 
-DATA_VOL  = modal.Volume.from_name("fineweb-data", create_if_missing=True)
-LOGS_VOL  = modal.Volume.from_name("nanogpt-logs", create_if_missing=True)
-
-DATA_DIR  = "/mnt/fineweb" 
-LOGS_DIR  = "/mnt/logs"      
-
+data_dir = "/root/data/fineweb10B"
+logs_dir = "/root/logs"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "torch==2.5.1",
-        "numpy",
-        "wandb",
-        "huggingface_hub",
-        "tqdm",
-    )
+    .pip_install("torch==2.5.1", "numpy", "huggingface_hub", "wandb")
     .add_local_file("train.py", "/root/train.py")
 )
 
-# data
-
-MAX_SHARDS = 103  # kjj0/fineweb10B-gpt2 has shards 000001–000103
 
 @app.function(
     image=image,
-    volumes={DATA_DIR: DATA_VOL},
-    cpu=4,
-    memory=8192,
+    volumes={data_dir: data_volume},
     timeout=7200,
 )
-def download_data(num_shards: int = 9):
-    """
-    Download pre-tokenised FineWeb shards from HuggingFace (kjj0/fineweb10B-gpt2).
-    Each shard is ~100 M tokens. 
-    """
-    num_shards = min(num_shards, MAX_SHARDS)
+def download_data(num_shards: int = 18):
     from huggingface_hub import hf_hub_download
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    def fetch(fname):
-        dest = os.path.join(DATA_DIR, fname)
-        if os.path.exists(dest):
-            print(f"  already present: {fname}")
-            return
-        print(f"  downloading: {fname} ...", flush=True)
+    os.makedirs(data_dir, exist_ok=True)
+    filenames = ["fineweb_val_000000.bin"] + [
+        f"fineweb_train_{i:06d}.bin" for i in range(1, num_shards + 1)
+    ]
+    for filename in filenames:
         hf_hub_download(
             repo_id="kjj0/fineweb10B-gpt2",
-            filename=fname,
+            filename=filename,
             repo_type="dataset",
-            local_dir=DATA_DIR,
+            local_dir=data_dir,
         )
-        print(f"  done: {fname}", flush=True)
-
-    #val shard
-    fetch("fineweb_val_000000.bin")
-
-    #training shards
-    for i in range(1, num_shards + 1):
-        fetch(f"fineweb_train_{i:06d}.bin")
-
-    DATA_VOL.commit()
-    print(f"\nFinished. {num_shards} training shard(s) in {DATA_DIR}.")
+    data_volume.commit()
 
 
-#training
+def run_training(gpus: int, project: str, name: str):
+    import wandb
 
-@app.function(
-    image=image,
-    gpu="H100",
-    volumes={
-        DATA_DIR: DATA_VOL,
-        LOGS_DIR: LOGS_VOL,
-    },
-    secrets=[modal.Secret.from_name("wandb-secret")],
-    timeout=86400, #24 hrs
-)
-def train(
-    num_iterations: int = 40000, # ceiling: ~10.3B tokens, safely above what baseline needs
-    target_val_loss: float = 3.28, #stop as soon as val loss hits this; set to 0 to disable
-    disable_wandb: bool = False,
-):
-    import subprocess
+    run = wandb.init(
+        project=project,
+        name=name or None,
+        config={
+            "gpus": gpus,
+            "train_steps": 3325,
+            "tokens_per_step": 524288,
+            "total_train_tokens": 3325 * 524288,
+        },
+    )
+    run.define_metric("train/tokens")
+    run.define_metric("training/*", step_metric="train/tokens")
+    run.define_metric("validation/*", step_metric="train/tokens")
+    run.define_metric("learning_rate/*", step_metric="train/tokens")
+    run.define_metric("optimization/*", step_metric="train/tokens")
+    run.define_metric("model/*", step_metric="train/tokens")
+    run.define_metric("system/*", step_metric="train/tokens")
+    training_line = re.compile(
+        r"step:(\d+)/(\d+) train_loss:([0-9.eE+-]+) tokens:(\d+) "
+        r"step_time:([0-9.eE+-]+)s grad_norm:([0-9.eE+-]+) "
+        r"param_norm:([0-9.eE+-]+) peak_gpu_memory_bytes:(\d+) "
+        r"lr_embed:([0-9.eE+-]+) lr_head:([0-9.eE+-]+) "
+        r"lr_scalar:([0-9.eE+-]+) lr_muonh:([0-9.eE+-]+)"
+    )
+    validation_line = re.compile(
+        r"step:(\d+)/(\d+) val_loss:([0-9.]+) best_val_loss:([0-9.]+)"
+    )
+    parameter_line = re.compile(r"num_params:(\d+)")
 
-    cmd = [
-        "python", "/root/train.py",
-        "--input_bin",       f"{DATA_DIR}/fineweb_train_*.bin",
-        "--input_val_bin",   f"{DATA_DIR}/fineweb_val_*.bin",
-        "--model",           "d12",
-        "--batch_size",      "64",
-        "--sequence_length", "1024",
-        "--total_batch_size","262144",
-        "--grad_accum_steps","4",
-        "--num_iterations",  str(num_iterations),
-        "--learning_rate",   "1.5e-3",
-        "--warmup_iters",    "0",
-        "--warmdown_iters",  "1800",
-        "--weight_decay",    "0.1",
-        "--val_loss_every",  "250",
-        "--val_max_steps",   "20",
-    ]
-    if target_val_loss > 0:
-        cmd += ["--target_val_loss", str(target_val_loss)]
+    try:
+        process = subprocess.Popen(
+            [
+                "torchrun",
+                "--standalone",
+                f"--nproc-per-node={gpus}",
+                "/root/train.py",
+            ],
+            cwd="/root",
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            parameter_match = parameter_line.search(line)
+            if parameter_match:
+                parameter_count = int(parameter_match.group(1))
+                run.config.update({"parameter_count": parameter_count})
+                run.summary["model/parameter_count"] = parameter_count
 
-    if disable_wandb or not os.environ.get("WANDB_API_KEY"):
-        cmd.append("--disable_wandb")
+            training_match = training_line.search(line)
+            if training_match:
+                run.log(
+                    {
+                        "train/tokens": int(training_match.group(4)),
+                        "training/loss": float(training_match.group(3)),
+                        "system/step_time_seconds": float(training_match.group(5)),
+                        "optimization/gradient_norm": float(training_match.group(6)),
+                        "model/parameter_norm": float(training_match.group(7)),
+                        "system/peak_gpu_memory_gb": int(training_match.group(8)) / 1e9,
+                        "learning_rate/embed": float(training_match.group(9)),
+                        "learning_rate/head": float(training_match.group(10)),
+                        "learning_rate/scalar": float(training_match.group(11)),
+                        "learning_rate/muonh": float(training_match.group(12)),
+                    }
+                )
+            validation_match = validation_line.search(line)
+            if validation_match:
+                step = int(validation_match.group(1))
+                run.log(
+                    {
+                        "train/tokens": step * 524288,
+                        "validation/loss": float(validation_match.group(3)),
+                        "validation/best_loss": float(validation_match.group(4)),
+                    }
+                )
+        returncode = process.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, process.args)
+    finally:
+        run.finish()
+        logs_volume.commit()
 
-    # Write logs directly into the persistent volume
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    result = subprocess.run(cmd, cwd=LOGS_DIR, env=env)
 
-    LOGS_VOL.commit()
-    return result.returncode
+train_options = {
+    "image": image,
+    "volumes": {data_dir: data_volume, logs_dir: logs_volume},
+    "secrets": [modal.Secret.from_name("wandb-secret")],
+    "timeout": 86400,
+}
 
 
-#local entrypoint
+@app.function(gpu="H100:8", **train_options)
+def train_8(project: str, name: str):
+    run_training(8, project, name)
+
+
+@app.function(gpu="H100:4", **train_options)
+def train_4(project: str, name: str):
+    run_training(4, project, name)
+
 
 @app.local_entrypoint()
-def main(
-    num_iterations: int = 40000,
-    target_val_loss: float = 3.28,
-    disable_wandb: bool = False,
-):
-    """
-    modal run modal_train.py                          # full baseline run, stops at 3.28
-    modal run modal_train.py --num-iterations 3814    # 1B token ablation run
-    modal run modal_train.py --target-val-loss 0      # disable early stop, run all steps
-    """
-    rc = train.remote(
-        num_iterations=num_iterations,
-        target_val_loss=target_val_loss,
-        disable_wandb=disable_wandb,
-    )
-    if rc != 0:
-        raise SystemExit(f"Training exited with code {rc}")
+def main(gpus: int = 8, project: str = "nanogpt-ablations", name: str = ""):
+    if gpus == 8:
+        train_8.remote(project, name)
+    elif gpus == 4:
+        train_4.remote(project, name)
+    else:
+        raise ValueError("--gpus must be 4 or 8")
