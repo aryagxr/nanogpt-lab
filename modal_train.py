@@ -1,6 +1,8 @@
 import os
 import re
 import subprocess
+from datetime import datetime
+from pathlib import Path
 
 import modal
 
@@ -42,7 +44,7 @@ def download_data(num_shards: int = 18):
     data_volume.commit()
 
 
-def run_training(gpus: int, project: str, name: str):
+def run_training(gpus: int, project: str, name: str, track: str):
     import wandb
 
     run = wandb.init(
@@ -55,6 +57,9 @@ def run_training(gpus: int, project: str, name: str):
             "total_train_tokens": 3325 * 524288,
         },
     )
+    experiment = re.sub(r"[^a-z0-9]+", "_", (name or run.id).lower()).strip("_")
+    record_dir = Path(logs_dir) / track / f"{datetime.now():%Y%m%d}_{experiment}"
+    existing_logs = set(Path(logs_dir).glob("*.txt"))
     run.define_metric("train/tokens")
     run.define_metric("training/*", step_metric="train/tokens")
     run.define_metric("validation/*", step_metric="train/tokens")
@@ -128,6 +133,10 @@ def run_training(gpus: int, project: str, name: str):
             raise subprocess.CalledProcessError(returncode, process.args)
     finally:
         run.finish()
+        record_dir.mkdir(parents=True, exist_ok=True)
+        for logfile in set(Path(logs_dir).glob("*.txt")) - existing_logs:
+            logfile.replace(record_dir / logfile.name)
+        Path(record_dir / "train.py").write_bytes(Path("/root/train.py").read_bytes())
         logs_volume.commit()
 
 
@@ -140,20 +149,22 @@ train_options = {
 
 
 @app.function(gpu="H100:8", **train_options)
-def train_8(project: str, name: str):
-    run_training(8, project, name)
+def train_8(project: str, name: str, track: str):
+    run_training(8, project, name, track)
 
 
 @app.function(gpu="H100:4", **train_options)
-def train_4(project: str, name: str):
-    run_training(4, project, name)
+def train_4(project: str, name: str, track: str):
+    run_training(4, project, name, track)
 
 
 @app.local_entrypoint()
-def main(gpus: int = 8, project: str = "nanogpt-lab", name: str = ""):
+def main(gpus: int = 8, project: str = "nanogpt-lab", name: str = "", track: str = "dense"):
+    if track not in {"dense", "sparse"}:
+        raise ValueError("--track must be dense or sparse")
     if gpus == 8:
-        train_8.remote(project, name)
+        train_8.remote(project, name, track)
     elif gpus == 4:
-        train_4.remote(project, name)
+        train_4.remote(project, name, track)
     else:
         raise ValueError("--gpus must be 4 or 8")
