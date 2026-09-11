@@ -312,6 +312,8 @@ val_tokens = 20 * 524288
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
+num_params = sum(p.numel() for p in model.parameters())
+print0(f"num_params:{num_params}", console=True)
 
 
 
@@ -390,6 +392,7 @@ for p in model.parameters():
 training_time = 0
 last_val_step = 0
 best_val_loss = float("inf")
+torch.cuda.reset_peak_memory_stats(device)
 dist.barrier()
 t0 = time.perf_counter()
 
@@ -422,17 +425,25 @@ for step in range(train_steps + 1):
         break
 
     #training
+    step_start = time.perf_counter()
     inputs, targets = next(train_loader)
     #gradient accumulation in microbatches
     assert len(inputs) % mbs == 0
     num_mbs = len(inputs) // mbs
+    train_loss = 0
     for i in range(num_mbs):
         #run fwd and bwd in microbatches
-        model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+        train_loss += loss.detach()
+        loss.backward()
     for name, param in model.named_parameters():
         assert param.grad is not None, name
         #sum up the gradients for every param across the gpu ranks
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+    dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
+    train_loss /= batch_size
+    grad_norm = torch.sqrt(sum(torch.linalg.vector_norm(param.grad, dtype=torch.float32).square()
+                               for param in model.parameters()))
 
     #set optimization hyperparams and take step
     set_hparams(step)
@@ -440,12 +451,23 @@ for step in range(train_steps + 1):
         opt.step()
     model.zero_grad(set_to_none=True)
 
+    param_norm = torch.sqrt(sum(torch.linalg.vector_norm(param, dtype=torch.float32).square()
+                                for param in model.parameters()))
+    torch.cuda.synchronize()
+    step_time = torch.tensor(time.perf_counter() - step_start, dtype=torch.float64, device=device)
+    peak_gpu_memory = torch.tensor(torch.cuda.max_memory_allocated(device), dtype=torch.float64, device=device)
+    dist.all_reduce(step_time, op=dist.ReduceOp.MAX)
+    dist.all_reduce(peak_gpu_memory, op=dist.ReduceOp.MAX)
+
     approx_training_time = training_time + (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.5f} tokens:{(step+1)*batch_size}"
+           + f" step_time:{step_time.item():.4f}s grad_norm:{grad_norm:.6e} param_norm:{param_norm:.6e}"
+           + f" peak_gpu_memory_bytes:{int(peak_gpu_memory.item())}"
+           + f" lr_embed:{optimizer1.param_groups[0]['lr']:.6e}"
+           + f" lr_head:{optimizer1.param_groups[1]['lr']:.6e}"
+           + f" lr_scalar:{optimizer1.param_groups[2]['lr']:.6e}"
+           + f" lr_muonh:{optimizer2.param_groups[0]['lr']:.6e}"
+           + f" train_time:{approx_training_time:.3f}s", console=True, log=False)
 
 
 dist.destroy_process_group()
-
-
-
