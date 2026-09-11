@@ -5,7 +5,7 @@ import subprocess
 import modal
 
 
-app = modal.App("nanogpt-ablations")
+app = modal.App("nanogpt-lab")
 
 data_volume = modal.Volume.from_name("fineweb-data", create_if_missing=True)
 logs_volume = modal.Volume.from_name("nanogpt-logs", create_if_missing=True)
@@ -150,7 +150,7 @@ def train_4(project: str, name: str):
 
 
 @app.local_entrypoint()
-def main(gpus: int = 8, project: str = "nanogpt-ablations", name: str = ""):
+def main(gpus: int = 8, project: str = "nanogpt-lab", name: str = ""):
     if gpus == 8:
         train_8.remote(project, name)
     elif gpus == 4:
