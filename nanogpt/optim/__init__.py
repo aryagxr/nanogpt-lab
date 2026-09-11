@@ -9,7 +9,4 @@ def build_optimizers(model, config):
     params = [p for opt in optimizers for group in opt.param_groups for p in group["params"]]
     assert len(params) == len(set(params))
     assert set(params) == set(model.parameters())
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
     return optimizers

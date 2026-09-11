@@ -8,6 +8,15 @@ name = "sdpa"
 head_dim = 128
 scale = 0.12
 
+[position]
+name = "rope"
+
+[norm]
+name = "rmsnorm"
+
+[residual]
+name = "standard"
+
 [optimizer]
 name = "muonh"
 lr = 0.018
@@ -18,8 +27,15 @@ scalar_lr = 0.01
 betas = [0.8, 0.95]
 eps = 1e-10
 weight_decay = 0.0
-aux_cooldown_frac = 0.4
-cooldown_frac = 1.0
+
+[schedule]
+name = "flat_cooldown"
+
+[schedule.cooldown_fraction]
+embed = 0.4
+head = 0.4
+scalar = 0.4
+muonh = 1.0
 
 [training]
 steps = 3325

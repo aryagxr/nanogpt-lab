@@ -15,6 +15,7 @@ import tomllib
 
 from nanogpt.model import GPT
 from nanogpt.optim import build_optimizers
+from nanogpt.schedule import build_schedule
 
 from pathlib import Path
 
@@ -127,7 +128,8 @@ if "seed" in training:
     torch.manual_seed(training["seed"])
 
 val_inputs, val_targets = next(distributed_data_generator(config["data"]["val"], val_tokens, seq_len))
-model = GPT(**config["model"], attention=config["attention"]).cuda()
+model = GPT(**config["model"], attention=config["attention"], position=config["position"],
+            norm=config["norm"], residual=config["residual"]).cuda()
 model.compile(dynamic=False)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"num_params:{num_params}", console=True)
@@ -159,24 +161,7 @@ for name, p in model.named_parameters():
 
 
 optimizers = build_optimizers(model, config["optimizer"])
-
-
-#LR scheduler
-#eta is lr multiplier η
-def set_hparams(step):
-    progress = step / train_steps
-    assert 0 <= progress < 1
-    for opt in optimizers:
-        for grp in opt.param_groups:
-            #if starting phase
-            if progress < 1 - grp["cooldown_frac"]:
-                eta = 1.0
-            else:
-                #cooldown phase, linear decrease
-                eta = (1 - progress) / grp["cooldown_frac"]
-            grp["lr"] = grp["initial_lr"] * eta
-
-            
+lr_schedule = build_schedule(optimizers, train_steps, config["schedule"])
 
 
 #train loop
@@ -243,7 +228,7 @@ for step in range(train_steps + 1):
                                for param in model.parameters()))
 
     #set optimization hyperparams and take step
-    set_hparams(step)
+    lr_schedule.step(step)
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)

@@ -78,9 +78,6 @@ def build_optimizers(model, config):
         weight_decay=config["weight_decay"], fused=True)
     optimizer2 = MuonH([p for p in model.blocks.parameters() if p.ndim == 2],
                        lr=config["lr"], mu=config["momentum"])
-    for group in optimizer1.param_groups:
-        group["cooldown_frac"] = config["aux_cooldown_frac"]
     for group in optimizer2.param_groups:
         group["name"] = "muonh"
-        group["cooldown_frac"] = config["cooldown_frac"]
     return [optimizer1, optimizer2]
