@@ -1,190 +1,167 @@
+"""Launch one HC/mHC run at a time on Modal; save losses and rank progression."""
 import json
 import os
-import time
-import re
 import shutil
 import subprocess
-import tempfile
-from datetime import datetime
+import time
 from pathlib import Path
 
 import modal
 
 
+CONFIGURATIONS = tuple(f"{arch}-{shape}" for arch in ("hc", "mhc")
+                       for shape in ("shallow-wide", "middle", "deep-narrow"))
 app = modal.App("nanogpt-lab")
-
 data_volume = modal.Volume.from_name("fineweb-data", create_if_missing=True)
 logs_volume = modal.Volume.from_name("nanogpt-logs", create_if_missing=True)
-
-data_dir = "/root/data/fineweb10B"
-logs_dir = "/root/logs"
-
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.5.1", "numpy", "huggingface_hub", "wandb")
-    .add_local_file("train.py", "/root/train.py")
-)
+image = (modal.Image.debian_slim(python_version="3.11")
+         .pip_install("torch==2.5.1", "numpy==1.26.4", "huggingface_hub==0.26.2",
+                      "wandb==0.18.7", "matplotlib==3.9.2")
+         .add_local_file("train.py", "/root/train.py")
+         .add_local_file("modal_train.py", "/root/modal_train.py"))
 
 
-@app.function(
-    image=image,
-    volumes={data_dir: data_volume},
-    timeout=7200,
-)
+@app.function(image=image, volumes={"/root/data/fineweb10B": data_volume}, timeout=7200)
 def download_data(num_shards: int = 18):
     from huggingface_hub import hf_hub_download
-
-    os.makedirs(data_dir, exist_ok=True)
-    filenames = ["fineweb_val_000000.bin"] + [
-        f"fineweb_train_{i:06d}.bin" for i in range(1, num_shards + 1)
-    ]
-    for filename in filenames:
-        hf_hub_download(
-            repo_id="kjj0/fineweb10B-gpt2",
-            filename=filename,
-            repo_type="dataset",
-            local_dir=data_dir,
-        )
+    for filename in ["fineweb_val_000000.bin"] + [f"fineweb_train_{i:06d}.bin"
+                                                    for i in range(1, num_shards + 1)]:
+        hf_hub_download(repo_id="kjj0/fineweb10B-gpt2", filename=filename,
+                        repo_type="dataset", local_dir="/root/data/fineweb10B")
     data_volume.commit()
 
 
-def run_training(gpus: int, project: str, name: str, track: str, revision: dict):
+def prepare_run_directory(suite, config, restart_failed=False):
+    directory = suite / config
+    if directory.exists():
+        metadata_path = directory / "metrics.json"
+        status = json.loads(metadata_path.read_text()).get("status") if metadata_path.exists() else None
+        if not restart_failed or status != "failed":
+            raise ValueError(f"Run already exists: {directory}. Only failed runs can use --restart-failed.")
+        archive = suite / "failed" / f"{config}-{time.time_ns()}"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        directory.rename(archive)
+        print(f"Preserved failed run at {archive}; restarting from step 0.", flush=True)
+    elif restart_failed:
+        raise ValueError(f"No failed run exists at {directory}; omit --restart-failed.")
+    directory.mkdir(parents=True)
+    return directory
+
+
+def run_training(gpus, config, project, name, restart_failed=False):
     import wandb
 
-    run = wandb.init(
-        project=project,
-        name=name or None,
-        config={**revision, "gpus": gpus},
-    )
-    experiment = re.sub(r"[^a-z0-9]+", "_", (name or run.id).lower()).strip("_") or run.id
-    record_dir = Path(logs_dir) / track / f"{datetime.now():%Y%m%d}_{experiment}_{run.id}"
-    record_dir.mkdir(parents=True, exist_ok=False)
-    shutil.copyfile("/root/train.py", record_dir / "train.py")
-    metrics = {**revision, "gpus": gpus, "wandb_url": run.url, "status": "running"}
-    started = time.perf_counter()
+    logs_volume.reload()
+    data_volume.reload()
+    suite = Path("/root/logs/dense/hc-mhc-depth-seed1337")
+    directory = prepare_run_directory(suite, config, restart_failed)
+    for source in ("train.py", "modal_train.py"):
+        shutil.copyfile(Path("/root") / source, directory / source)
+    logs_volume.commit()
 
+    sinkhorn_version = "log-softmax-v2" if config.startswith("mhc-") else None
+    run = wandb.init(project=project, name=name or f"{config}-seed1337",
+                     group="hc-mhc-depth-seed1337", tags=[config.split("-", 1)[0], "hc-mhc-depth"],
+                     config={"configuration": config, "seed": 1337, "gpus": gpus,
+                             "sinkhorn_implementation": sinkhorn_version},
+                     dir=str(directory))
     run.define_metric("train/tokens")
     run.define_metric("training/*", step_metric="train/tokens")
     run.define_metric("validation/*", step_metric="train/tokens")
-    run.define_metric("learning_rate/*", step_metric="train/tokens")
-    run.define_metric("optimization/*", step_metric="train/tokens")
-    run.define_metric("model/*", step_metric="train/tokens")
-    run.define_metric("system/*", step_metric="train/tokens")
-    training_line = re.compile(
-        r"step:(\d+)/(\d+) train_loss:([0-9.eE+-]+) tokens:(\d+) "
-        r"step_time:([0-9.eE+-]+)s grad_norm:([0-9.eE+-]+) "
-        r"param_norm:([0-9.eE+-]+) peak_gpu_memory_bytes:(\d+)"
-    )
-    validation_line = re.compile(
-        r"step:(\d+)/(\d+) val_loss:([0-9.]+) best_val_loss:([0-9.]+)"
-    )
-    parameter_line = re.compile(r"num_params:(\d+)")
+    run.define_metric("routing/*", step_metric="train/tokens")
+    metadata = {"configuration": config, "seed": 1337, "gpus": gpus,
+                "wandb_url": run.url, "status": "running"}
+    (directory / "metrics.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    started = time.monotonic()
+    last_commit = started
+    event_position = 0
+    event_path = directory / "events.jsonl"
 
-    output = (record_dir / "output.log").open("w", buffering=1)
-    workdir = tempfile.TemporaryDirectory(prefix="nanogpt-")
-    # Keep the standalone script's relative data/ and logs/ paths working.
-    Path(workdir.name, "data").symlink_to(Path(data_dir).parent, target_is_directory=True)
-    Path(workdir.name, "logs").symlink_to(record_dir, target_is_directory=True)
-    tokens_seen = 0
+    def drain_events(history):
+        nonlocal event_position
+        if not event_path.exists():
+            return
+        with event_path.open() as events:
+            events.seek(event_position)
+            while line := events.readline():
+                payload = json.loads(line)
+                history.write(line)
+                try:
+                    run.log(payload)
+                except Exception as error:
+                    print(f"W&B logging error; data saved locally: {error}", flush=True)
+            event_position = events.tell()
+
     try:
         process = subprocess.Popen(
-            [
-                "torchrun",
-                "--standalone",
-                f"--nproc-per-node={gpus}",
-                "/root/train.py",
-            ],
-            cwd=workdir.name,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            output.write(line)
-            parameter_match = parameter_line.search(line)
-            if parameter_match:
-                parameter_count = int(parameter_match.group(1))
-                run.config.update({"parameter_count": parameter_count})
-                run.summary["model/parameter_count"] = parameter_count
-
-            training_match = training_line.search(line)
-            if training_match:
-                tokens_seen = int(training_match.group(4))
-                run.log(
-                    {
-                        "train/tokens": tokens_seen,
-                        "training/loss": float(training_match.group(3)),
-                        "system/step_time_seconds": float(training_match.group(5)),
-                        "optimization/gradient_norm": float(training_match.group(6)),
-                        "model/parameter_norm": float(training_match.group(7)),
-                        "system/peak_gpu_memory_gb": int(training_match.group(8)) / 1e9,
-                        **{f"learning_rate/{key}": float(value)
-                           for key, value in re.findall(r"lr_(\w+):([0-9.eE+-]+)", line)},
-                    }
-                )
-            validation_match = validation_line.search(line)
-            if validation_match:
-                run.log(
-                    {
-                        "train/tokens": tokens_seen,
-                        "validation/loss": float(validation_match.group(3)),
-                        "validation/best_loss": float(validation_match.group(4)),
-                    }
-                )
-        returncode = process.wait()
-        if returncode != 0:
-            raise subprocess.CalledProcessError(returncode, process.args)
-        metrics["status"] = "completed"
+            ["torchrun", "--standalone", f"--nproc-per-node={gpus}", "/root/train.py",
+             "--configuration", config, "--output-dir", str(directory),
+             "--events-file", str(event_path)],
+            cwd="/root", env={**os.environ, "PYTHONUNBUFFERED": "1",
+                              "TORCHINDUCTOR_COMPILE_THREADS": "1"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        with (directory / "output.log").open("w", buffering=1) as output, \
+             (directory / "history.jsonl").open("w", buffering=1) as history:
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                output.write(line)
+                drain_events(history)
+                if time.monotonic() - last_commit >= 60:
+                    logs_volume.commit()
+                    last_commit = time.monotonic()
+            if process.wait() != 0:
+                raise RuntimeError(f"Training exited with code {process.returncode}")
+            drain_events(history)
+        progression = directory / "rank_progression.jsonl"
+        if not (directory / "rank_per_token.npy").exists() \
+                or not progression.exists() or len(progression.read_text().splitlines()) != 21:
+            raise RuntimeError("Training finished without complete rank data")
+        metadata["status"] = "completed"
+        try:
+            plot = subprocess.run(["python", "/root/train.py", "--plot-rank",
+                                   "--suite-dir", str(suite)], cwd="/root", check=True)
+            if plot.returncode == 0 and (suite / "effective_rank_progression.png").exists():
+                run.log({"plots/effective_rank_progression": wandb.Image(
+                    str(suite / "effective_rank_progression.png"))})
+        except Exception as error:
+            print(f"Rank plot failed; raw rank data is saved: {error}", flush=True)
+    except Exception:
+        metadata["status"] = "failed"
+        raise
     finally:
-        output.close()
-        workdir.cleanup()
-        metrics.update(dict(run.summary))
-        metrics["wall_clock_seconds"] = time.perf_counter() - started
-        if metrics["status"] != "completed":
-            metrics["status"] = "failed"
-        (record_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+        metadata["wall_clock_seconds"] = time.monotonic() - started
+        (directory / "metrics.json").write_text(json.dumps(metadata, indent=2) + "\n")
         logs_volume.commit()
-        run.finish()
-        print(f"Saved run: {record_dir.relative_to(logs_dir)}")
+        try:
+            run.finish(exit_code=0 if metadata["status"] == "completed" else 1)
+        finally:
+            logs_volume.commit()
 
 
-
-train_options = {
-    "image": image,
-    "volumes": {data_dir: data_volume, logs_dir: logs_volume},
-    "secrets": [modal.Secret.from_name("wandb-secret")],
-    "timeout": 86400,
-}
+train_options = dict(image=image,
+                     volumes={"/root/data/fineweb10B": data_volume, "/root/logs": logs_volume},
+                     secrets=[modal.Secret.from_name("wandb-secret")], timeout=86400,
+                     max_containers=1, cpu=16, memory=65536)
 
 
 @app.function(gpu="H100:8", **train_options)
-def train_8(project: str, name: str, track: str, revision: dict):
-    run_training(8, project, name, track, revision)
+def train_8(config: str, project: str, name: str, restart_failed: bool = False):
+    run_training(8, config, project, name, restart_failed)
 
 
 @app.function(gpu="H100:4", **train_options)
-def train_4(project: str, name: str, track: str, revision: dict):
-    run_training(4, project, name, track, revision)
+def train_4(config: str, project: str, name: str, restart_failed: bool = False):
+    run_training(4, config, project, name, restart_failed)
 
 
 @app.local_entrypoint()
-# Keep the W&B project stable independently of the Modal app/repository name.
-def main(gpus: int = 8, project: str = "nanogpt-lab", name: str = "", track: str = "dense"):
-    revision = {
-        "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "git_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()),
-    }
-    if revision["git_dirty"]:
-        print("Uncommitted changes: the exact train.py will be saved with this run.")
-    if track not in {"dense", "sparse"}:
-        raise ValueError("--track must be dense or sparse")
-    print(f"W&B project: {project}; run name: {name or '(automatic)'}")
+def main(config: str, gpus: int = 8, project: str = "nanogpt-lab", name: str = "",
+         restart_failed: bool = False):
+    if config not in CONFIGURATIONS:
+        raise ValueError(f"Choose one of {CONFIGURATIONS}")
     if gpus == 8:
-        train_8.remote(project, name, track, revision)
+        train_8.remote(config, project, name, restart_failed)
     elif gpus == 4:
-        train_4.remote(project, name, track, revision)
+        train_4.remote(config, project, name, restart_failed)
     else:
         raise ValueError("--gpus must be 4 or 8")
